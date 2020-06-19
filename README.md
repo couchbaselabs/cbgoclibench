@@ -61,6 +61,7 @@ maintaining a throughput within 10% of the initially discovered peak.
 | SDK         | Avg. CPU | Docs/S  | Avg. Latency | Tuning                                  |
 | ----------- | -------- | ------- | ------------ | --------------------------------------- |
 | gocb        | 713%     | 26,418  | 2.10ms       | num-concurrent-ops=64                   |
+| gocbcore    | 476%     | 165,957 | 0.29ms       | conn-pool-size=1,num-concurrent-ops=128 |
 | gocbcore    | 497%     | 168,356 | 2.55ms       | conn-pool-size=1,num-concurrent-ops=512 |
 | gocbcore    | 688%     | 299,204 | 1.21ms       | conn-pool-size=8,num-concurrent-ops=512 |
 | gocouch     | 783%     | 42,782  | 2.57ms       | num-concurrent-ops=128                  |
