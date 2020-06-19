@@ -60,6 +60,7 @@ maintaining a throughput within 10% of the initially discovered peak.
 
 | SDK         | Avg. CPU | Docs/S  | Avg. Latency | Tuning                                  |
 | ----------- | -------- | ------- | ------------ | --------------------------------------- |
+| gocb        | 713%     | 26,418  | 2.10ms       | num-concurrent-ops=64                   |
 | gocbcore    | 497%     | 168,356 | 2.55ms       | conn-pool-size=1,num-concurrent-ops=512 |
 | gocbcore    | 688%     | 299,204 | 1.21ms       | conn-pool-size=8,num-concurrent-ops=512 |
 | gocouch     | 783%     | 42,782  | 2.57ms       | num-concurrent-ops=128                  |
@@ -69,6 +70,23 @@ maintaining a throughput within 10% of the initially discovered peak.
 Note: Any unspecified tunning options here implies that the default values from the client are used.
 
 ### Details
+
+#### gocb
+
+```
+$ ./cbgoclibench \
+  ... \
+  --doc-count=65536 \
+  --duration=60s \
+  --num-concurrent-ops=64 \
+  gocb
+
+Ran for 60029ms
+Read 1560675 docs
+Had 0 errors
+Average docs/s of 26418.25
+Average latency of 2.102503 milliseconds
+```
 
 #### gocbcore (default connection pool)
 
