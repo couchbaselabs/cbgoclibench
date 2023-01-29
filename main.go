@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
@@ -16,6 +17,7 @@ import (
 	"github.com/couchbase/gocb/v2"
 	gocbcorev7 "github.com/couchbase/gocbcore"
 	"github.com/couchbase/gocbcore/v9"
+	"github.com/couchbase/gocbcorex"
 	"github.com/couchbase/goutils/logging"
 )
 
@@ -226,6 +228,9 @@ func main() {
 	case "gocouchbulk":
 		log.Printf("Running `gocouchbulk` benchmark...")
 		benchGocouchBulk(*duration, *addr, *username, *password, *docCount, *numConcurrentOps, *batchSize)
+	case "gocbcorex":
+		log.Printf("Running `gocbcorex` benchmark...")
+		benchGocbcoreX(*duration, *addr, *username, *password, *docCount, *numConcurrentOps)
 	}
 }
 
@@ -649,4 +654,60 @@ func benchGocouchBulk(duration time.Duration, addr, username, password string, d
 	bench.EndAndPrintReport()
 
 	bucket.Close()
+}
+
+func benchGocbcoreX(duration time.Duration, addr, username, password string, docCount int, numConcurrentOps int) {
+	bench := benchRunner{
+		Name: fmt.Sprintf("corex (docs: %d, concurrency: %d)",
+			docCount, numConcurrentOps)}
+
+	agent, err := gocbcorex.CreateAgent(
+		context.Background(),
+		gocbcorex.AgentOptions{
+			SeedConfig: gocbcorex.SeedConfig{
+				MemdAddrs: []string{addr + ":11210"},
+				HTTPAddrs: []string{addr + ":8091"},
+			},
+			Authenticator: &gocbcorex.PasswordAuthenticator{
+				Username: username,
+				Password: password,
+			},
+			BucketName: "default",
+		})
+	if err != nil {
+		panic(err)
+	}
+
+	bench.Start()
+
+	var wg sync.WaitGroup
+	var sendOneGet func()
+	sendOneGet = func() {
+		bop := bench.StartOp()
+
+		key := selectOneKey(docCount)
+		_, err := agent.Get(context.Background(), &gocbcorex.GetOptions{
+			Key: []byte(key),
+		})
+
+		bench.EndOp(bop, err)
+
+		if bench.IsRunning() {
+			sendOneGet()
+		} else {
+			wg.Done()
+		}
+	}
+
+	for i := 0; i < numConcurrentOps; i++ {
+		wg.Add(1)
+		go sendOneGet()
+	}
+
+	bench.WaitAndStop(duration)
+	wg.Wait()
+
+	bench.EndAndPrintReport()
+
+	//agent.Close(nil)
 }
