@@ -78,6 +78,77 @@ func selectOneKey(docCount int) string {
 	return fmt.Sprintf("upsert-get-%d", docID)
 }
 
+type benchRunner struct {
+	Name string
+
+	startTime  time.Time
+	isRunning  uint64
+	ttlTimeNs  uint64
+	ttlSuccess uint64
+	ttlError   uint64
+}
+
+type benchRunnerOp struct {
+	startTime time.Time
+}
+
+func (b *benchRunner) Start() {
+	atomic.StoreUint64(&b.isRunning, 1)
+	b.startTime = time.Now()
+	b.ttlTimeNs = 0
+	b.ttlSuccess = 0
+	b.ttlError = 0
+}
+
+func (b *benchRunner) WaitAndStop(t time.Duration) {
+	<-time.After(time.Until(b.startTime.Add(t)))
+	atomic.StoreUint64(&b.isRunning, 0)
+}
+
+func (b *benchRunner) EndAndPrintReport() {
+	dtime := time.Since(b.startTime)
+	dtimeMs := dtime.Milliseconds()
+
+	ttlSuccess := atomic.LoadUint64(&b.ttlSuccess)
+	ttlError := atomic.LoadUint64(&b.ttlError)
+	ttlOps := ttlSuccess + ttlError
+	ttlTimeNs := atomic.LoadUint64(&b.ttlTimeNs)
+
+	ttlTime := time.Duration(ttlTimeNs) * time.Nanosecond
+
+	log.Printf("%s:", b.Name)
+	log.Printf("	Ran for %dms", dtimeMs)
+	log.Printf("	Read %d docs (+%d errors)", ttlSuccess, ttlError)
+	log.Printf("	Average docs/s of %.0f", float64(ttlSuccess)/float64(dtime/time.Second))
+	log.Printf("	Average latency of %f milliseconds", float64(ttlTime/time.Millisecond)/float64(ttlOps))
+}
+
+func (b *benchRunner) StartOp() benchRunnerOp {
+	return benchRunnerOp{
+		startTime: time.Now(),
+	}
+}
+
+func (b *benchRunner) EndMultiOp(o benchRunnerOp, err error, numOps uint64) {
+	dtime := time.Since(o.startTime)
+	dtimeNs := uint64(dtime / time.Nanosecond)
+
+	if err == nil {
+		atomic.AddUint64(&b.ttlSuccess, numOps)
+	} else {
+		atomic.AddUint64(&b.ttlError, numOps)
+	}
+	atomic.AddUint64(&b.ttlTimeNs, dtimeNs*numOps)
+}
+
+func (b *benchRunner) EndOp(o benchRunnerOp, err error) {
+	b.EndMultiOp(o, err, 1)
+}
+
+func (b *benchRunner) IsRunning() bool {
+	return atomic.LoadUint64(&b.isRunning) != 0
+}
+
 func main() {
 	addr := flag.String("host", "172.23.111.135", "The address to connect to")
 	username := flag.String("username", "Administrator", "The username to use")
@@ -136,6 +207,10 @@ func main() {
 }
 
 func benchGocb(duration time.Duration, addr, username, password string, docCount int, numConcurrentOps int) {
+	bench := benchRunner{
+		Name: fmt.Sprintf("Gocb (docs: %d, concurrency: %d)",
+			docCount, numConcurrentOps)}
+
 	connStr := fmt.Sprintf("couchbase://%s", addr)
 	cluster, err := gocb.Connect(connStr, gocb.ClusterOptions{
 		Authenticator: gocb.PasswordAuthenticator{
@@ -157,67 +232,42 @@ func benchGocb(duration time.Duration, addr, username, password string, docCount
 		panic(err)
 	}
 
-	var benchRunning uint32 = 1
-	var attlSuccess, attlError, attlOps, attlTime uint64
-	var wg sync.WaitGroup
+	bench.Start()
 
+	var wg sync.WaitGroup
 	var sendOneGet func()
 	sendOneGet = func() {
-		stime := time.Now()
+		bop := bench.StartOp()
 
 		_, err := coll.Get(selectOneKey(docCount), nil)
 
-		etime := time.Now()
-		dtimeMs := etime.Sub(stime).Milliseconds()
+		bench.EndOp(bop, err)
 
-		atomic.AddUint64(&attlOps, 1)
-		atomic.AddUint64(&attlTime, uint64(dtimeMs))
-		if err != nil {
-			log.Printf("failed to send get %v", err)
-			atomic.AddUint64(&attlError, 1)
-		} else {
-			atomic.AddUint64(&attlSuccess, 1)
-		}
-
-		if atomic.LoadUint32(&benchRunning) == 1 {
+		if bench.IsRunning() {
 			sendOneGet()
 		} else {
 			wg.Done()
 		}
 	}
 
-	stime := time.Now()
-
-	endWaitCh := time.After(duration)
-
 	for i := 0; i < numConcurrentOps; i++ {
 		wg.Add(1)
 		go sendOneGet()
 	}
 
-	<-endWaitCh
-	atomic.StoreUint32(&benchRunning, 0)
+	bench.WaitAndStop(duration)
 	wg.Wait()
 
-	etime := time.Now()
-	dtimeMs := etime.Sub(stime).Milliseconds()
-
-	ttlSuccess := atomic.LoadUint64(&attlSuccess)
-	ttlError := atomic.LoadUint64(&attlError)
-	ttlOps := atomic.LoadUint64(&attlOps)
-	ttlTime := atomic.LoadUint64(&attlTime)
-
-	log.Printf("gocb:")
-	log.Printf("	Ran for %dms", dtimeMs)
-	log.Printf("	Read %d docs", ttlSuccess)
-	log.Printf("	Had %d errors", ttlError)
-	log.Printf("	Average docs/s of %.2f", float64(ttlSuccess)/float64(dtimeMs)*1000)
-	log.Printf("	Average latency of %f milliseconds", float64(ttlTime)/float64(ttlOps))
+	bench.EndAndPrintReport()
 
 	cluster.Close(nil)
 }
 
 func benchGocbv1(duration time.Duration, addr, username, password string, docCount int, numConcurrentOps int) {
+	bench := benchRunner{
+		Name: fmt.Sprintf("Gocbv1 (docs: %d, concurrency: %d)",
+			docCount, numConcurrentOps)}
+
 	connStr := fmt.Sprintf("couchbase://%s", addr)
 	cluster, err := gocbv1.Connect(connStr)
 	if err != nil {
@@ -248,68 +298,43 @@ func benchGocbv1(duration time.Duration, addr, username, password string, docCou
 		<-warmWaitCh
 	}
 
-	var benchRunning uint32 = 1
-	var attlSuccess, attlError, attlOps, attlTime uint64
-	var wg sync.WaitGroup
+	bench.Start()
 
+	var wg sync.WaitGroup
 	var sendOneGet func()
 	sendOneGet = func() {
-		stime := time.Now()
+		bop := bench.StartOp()
 
 		var b []byte
 		_, err := bucket.Get(selectOneKey(docCount), &b)
 
-		etime := time.Now()
-		dtimeMs := etime.Sub(stime).Milliseconds()
+		bench.EndOp(bop, err)
 
-		atomic.AddUint64(&attlOps, 1)
-		atomic.AddUint64(&attlTime, uint64(dtimeMs))
-		if err != nil {
-			log.Printf("failed to send get %v", err)
-			atomic.AddUint64(&attlError, 1)
-		} else {
-			atomic.AddUint64(&attlSuccess, 1)
-		}
-
-		if atomic.LoadUint32(&benchRunning) == 1 {
+		if bench.IsRunning() {
 			sendOneGet()
 		} else {
 			wg.Done()
 		}
 	}
 
-	stime := time.Now()
-
-	endWaitCh := time.After(duration)
-
 	for i := 0; i < numConcurrentOps; i++ {
 		wg.Add(1)
 		go sendOneGet()
 	}
 
-	<-endWaitCh
-	atomic.StoreUint32(&benchRunning, 0)
+	bench.WaitAndStop(duration)
 	wg.Wait()
 
-	etime := time.Now()
-	dtimeMs := etime.Sub(stime).Milliseconds()
-
-	ttlSuccess := atomic.LoadUint64(&attlSuccess)
-	ttlError := atomic.LoadUint64(&attlError)
-	ttlOps := atomic.LoadUint64(&attlOps)
-	ttlTime := atomic.LoadUint64(&attlTime)
-
-	log.Printf("gocbv1:")
-	log.Printf("	Ran for %dms", dtimeMs)
-	log.Printf("	Read %d docs", ttlSuccess)
-	log.Printf("	Had %d errors", ttlError)
-	log.Printf("	Average docs/s of %.2f", float64(ttlSuccess)/float64(dtimeMs)*1000)
-	log.Printf("	Average latency of %f milliseconds", float64(ttlTime)/float64(ttlOps))
+	bench.EndAndPrintReport()
 
 	cluster.Close()
 }
 
 func benchGocbcore(duration time.Duration, addr, username, password string, docCount int, kvPoolSize, maxQueueSize, numConcurrentOps int) {
+	bench := benchRunner{
+		Name: fmt.Sprintf("Gocbcore (docs: %d, concurrency: %d, pool-size: %d, queue-size: %d)",
+			docCount, numConcurrentOps, kvPoolSize, maxQueueSize)}
+
 	connStr := fmt.Sprintf("couchbase://%s", addr)
 	config := gocbcore.AgentConfig{}
 	err := config.FromConnStr(connStr)
@@ -349,72 +374,47 @@ func benchGocbcore(duration time.Duration, addr, username, password string, docC
 	<-warmWaitCh
 
 	// Do the benchmark
-	var benchRunning uint32 = 1
-	var attlSuccess, attlError, attlOps, attlTime uint64
-	var wg sync.WaitGroup
+	bench.Start()
 
+	var wg sync.WaitGroup
 	var sendOneGet func()
 	sendOneGet = func() {
-		stime := time.Now()
+		bop := bench.StartOp()
+
 		_, err = agent.Get(gocbcore.GetOptions{
 			Key: []byte(selectOneKey(docCount)),
 		}, func(result *gocbcore.GetResult, err error) {
-			etime := time.Now()
-			dtimeMs := etime.Sub(stime).Milliseconds()
+			bench.EndOp(bop, err)
 
-			atomic.AddUint64(&attlOps, 1)
-			atomic.AddUint64(&attlTime, uint64(dtimeMs))
-			if err != nil {
-				log.Printf("failed to send get %v", err)
-				atomic.AddUint64(&attlError, 1)
-			} else {
-				atomic.AddUint64(&attlSuccess, 1)
-			}
-
-			if atomic.LoadUint32(&benchRunning) == 1 {
+			if bench.IsRunning() {
 				sendOneGet()
 			} else {
 				wg.Done()
 			}
 		})
 		if err != nil {
-			log.Printf("failed to send get %v", err)
-			atomic.AddUint64(&attlError, 1)
+			bench.EndOp(bop, err)
 		}
 	}
-
-	stime := time.Now()
-
-	endWaitCh := time.After(duration)
 
 	for i := 0; i < numConcurrentOps; i++ {
 		wg.Add(1)
 		sendOneGet()
 	}
 
-	<-endWaitCh
-	atomic.StoreUint32(&benchRunning, 0)
+	bench.WaitAndStop(duration)
 	wg.Wait()
 
-	etime := time.Now()
-	dtimeMs := etime.Sub(stime).Milliseconds()
-
-	ttlSuccess := atomic.LoadUint64(&attlSuccess)
-	ttlError := atomic.LoadUint64(&attlError)
-	ttlOps := atomic.LoadUint64(&attlOps)
-	ttlTime := atomic.LoadUint64(&attlTime)
-
-	log.Printf("gocbcore:")
-	log.Printf("	Ran for %dms", dtimeMs)
-	log.Printf("	Read %d docs", ttlSuccess)
-	log.Printf("	Had %d errors", ttlError)
-	log.Printf("	Average docs/s of %.2f", float64(ttlSuccess)/float64(dtimeMs)*1000)
-	log.Printf("	Average latency of %f milliseconds", float64(ttlTime)/float64(ttlOps))
+	bench.EndAndPrintReport()
 
 	agent.Close()
 }
 
 func benchGocbcorev7(duration time.Duration, addr, username, password string, docCount int, kvPoolSize, maxQueueSize, numConcurrentOps int) {
+	bench := benchRunner{
+		Name: fmt.Sprintf("Gocbcorev7 (docs: %d, concurrency: %d, pool-size: %d, queue-size: %d)",
+			docCount, numConcurrentOps, kvPoolSize, maxQueueSize)}
+
 	connStr := fmt.Sprintf("couchbase://%s", addr)
 	config := gocbcorev7.AgentConfig{}
 	err := config.FromConnStr(connStr)
@@ -450,72 +450,47 @@ func benchGocbcorev7(duration time.Duration, addr, username, password string, do
 	}
 
 	// Do the benchmark
-	var benchRunning uint32 = 1
-	var attlSuccess, attlError, attlOps, attlTime uint64
-	var wg sync.WaitGroup
+	bench.Start()
 
+	var wg sync.WaitGroup
 	var sendOneGet func()
 	sendOneGet = func() {
-		stime := time.Now()
+		bop := bench.StartOp()
+
 		_, err = agent.GetEx(gocbcorev7.GetOptions{
 			Key: []byte(selectOneKey(docCount)),
 		}, func(result *gocbcorev7.GetResult, err error) {
-			etime := time.Now()
-			dtimeMs := etime.Sub(stime).Milliseconds()
+			bench.EndOp(bop, err)
 
-			atomic.AddUint64(&attlOps, 1)
-			atomic.AddUint64(&attlTime, uint64(dtimeMs))
-			if err != nil {
-				log.Printf("failed to send get %v", err)
-				atomic.AddUint64(&attlError, 1)
-			} else {
-				atomic.AddUint64(&attlSuccess, 1)
-			}
-
-			if atomic.LoadUint32(&benchRunning) == 1 {
+			if bench.IsRunning() {
 				sendOneGet()
 			} else {
 				wg.Done()
 			}
 		})
 		if err != nil {
-			log.Printf("failed to send get %v", err)
-			atomic.AddUint64(&attlError, 1)
+			bench.EndOp(bop, err)
 		}
 	}
-
-	stime := time.Now()
-
-	endWaitCh := time.After(duration)
 
 	for i := 0; i < numConcurrentOps; i++ {
 		wg.Add(1)
 		sendOneGet()
 	}
 
-	<-endWaitCh
-	atomic.StoreUint32(&benchRunning, 0)
+	bench.WaitAndStop(duration)
 	wg.Wait()
 
-	etime := time.Now()
-	dtimeMs := etime.Sub(stime).Milliseconds()
-
-	ttlSuccess := atomic.LoadUint64(&attlSuccess)
-	ttlError := atomic.LoadUint64(&attlError)
-	ttlOps := atomic.LoadUint64(&attlOps)
-	ttlTime := atomic.LoadUint64(&attlTime)
-
-	log.Printf("gocbcore:")
-	log.Printf("	Ran for %dms", dtimeMs)
-	log.Printf("	Read %d docs", ttlSuccess)
-	log.Printf("	Had %d errors", ttlError)
-	log.Printf("	Average docs/s of %.2f", float64(ttlSuccess)/float64(dtimeMs)*1000)
-	log.Printf("	Average latency of %f milliseconds", float64(ttlTime)/float64(ttlOps))
+	bench.EndAndPrintReport()
 
 	agent.Close()
 }
 
 func benchGocouch(duration time.Duration, addr, username, password string, docCount int, numConcurrentOps int) {
+	bench := benchRunner{
+		Name: fmt.Sprintf("Gocouch (docs: %d, concurrency: %d)",
+			docCount, numConcurrentOps)}
+
 	logging.SetLogger(nil)
 	c, err := couchbase.ConnectWithAuthCreds(fmt.Sprintf("http://%s:8091/", addr), username, password)
 	if err != nil {
@@ -546,67 +521,42 @@ func benchGocouch(duration time.Duration, addr, username, password string, docCo
 	}
 
 	// Do the benchmark
-	var benchRunning uint32 = 1
-	var attlSuccess, attlError, attlOps, attlTime uint64
-	var wg sync.WaitGroup
+	bench.Start()
 
+	var wg sync.WaitGroup
 	var sendOneGet func()
 	sendOneGet = func() {
-		stime := time.Now()
+		bop := bench.StartOp()
 
 		_, err := bucket.GetRaw(selectOneKey(docCount))
 
-		etime := time.Now()
-		dtimeMs := etime.Sub(stime).Milliseconds()
+		bench.EndOp(bop, err)
 
-		atomic.AddUint64(&attlOps, 1)
-		atomic.AddUint64(&attlTime, uint64(dtimeMs))
-		if err != nil {
-			log.Printf("failed to send get %v", err)
-			atomic.AddUint64(&attlError, 1)
-		} else {
-			atomic.AddUint64(&attlSuccess, 1)
-		}
-
-		if atomic.LoadUint32(&benchRunning) == 1 {
+		if bench.IsRunning() {
 			sendOneGet()
 		} else {
 			wg.Done()
 		}
 	}
 
-	stime := time.Now()
-
-	endWaitCh := time.After(duration)
-
 	for i := 0; i < numConcurrentOps; i++ {
 		wg.Add(1)
 		go sendOneGet()
 	}
 
-	<-endWaitCh
-	atomic.StoreUint32(&benchRunning, 0)
+	bench.WaitAndStop(duration)
 	wg.Wait()
 
-	etime := time.Now()
-	dtimeMs := etime.Sub(stime).Milliseconds()
-
-	ttlSuccess := atomic.LoadUint64(&attlSuccess)
-	ttlError := atomic.LoadUint64(&attlError)
-	ttlOps := atomic.LoadUint64(&attlOps)
-	ttlTime := atomic.LoadUint64(&attlTime)
-
-	log.Printf("gocouch:")
-	log.Printf("	Ran for %dms", dtimeMs)
-	log.Printf("	Read %d docs", ttlSuccess)
-	log.Printf("	Had %d errors", ttlError)
-	log.Printf("	Average docs/s of %.2f", float64(ttlSuccess)/float64(dtimeMs)*1000)
-	log.Printf("	Average latency of %f milliseconds", float64(ttlTime)/float64(ttlOps))
+	bench.EndAndPrintReport()
 
 	bucket.Close()
 }
 
 func benchGocouchBulk(duration time.Duration, addr, username, password string, docCount int, numConcurrentBatches, batchSize int) {
+	bench := benchRunner{
+		Name: fmt.Sprintf("GocouchBulk (docs: %d, concurrency: %d, batch-size: %d)",
+			docCount, numConcurrentBatches, batchSize)}
+
 	logging.SetLogger(nil)
 	c, err := couchbase.ConnectWithAuthCreds(fmt.Sprintf("http://%s:8091/", addr), username, password)
 	if err != nil {
@@ -639,70 +589,41 @@ func benchGocouchBulk(duration time.Duration, addr, username, password string, d
 	}
 
 	// Do the benchmark
-	var benchRunning uint32 = 1
-	var attlSuccess, attlError, attlOps, attlTime uint64
-	var wg sync.WaitGroup
+	bench.Start()
 
+	var wg sync.WaitGroup
 	var sendOneGet func()
 	sendOneGet = func() {
 		batchKeys := make([]string, batchSize)
 
-		stime := time.Now()
+		bop := bench.StartOp()
 
 		for i := 0; i < batchSize; i++ {
 			batchKeys[i] = selectOneKey(docCount)
 		}
 		res, err := bucket.GetBulkRaw(batchKeys)
 
-		etime := time.Now()
-		dtimeMs := etime.Sub(stime).Milliseconds()
-
 		// This is needed due to deduplication
-		numFetchedDocs := len(res)
+		numFetchedDocs := uint64(len(res))
 
-		atomic.AddUint64(&attlOps, 1)
-		atomic.AddUint64(&attlTime, uint64(dtimeMs))
-		if err != nil {
-			log.Printf("failed to send bulk get %v", err)
-			atomic.AddUint64(&attlError, uint64(numFetchedDocs))
-		} else {
-			atomic.AddUint64(&attlSuccess, uint64(numFetchedDocs))
-		}
+		bench.EndMultiOp(bop, err, numFetchedDocs)
 
-		if atomic.LoadUint32(&benchRunning) == 1 {
+		if bench.IsRunning() {
 			sendOneGet()
 		} else {
 			wg.Done()
 		}
 	}
 
-	stime := time.Now()
-
-	endWaitCh := time.After(duration)
-
 	for i := 0; i < numConcurrentBatches; i++ {
 		wg.Add(1)
 		go sendOneGet()
 	}
 
-	<-endWaitCh
-	atomic.StoreUint32(&benchRunning, 0)
+	bench.WaitAndStop(duration)
 	wg.Wait()
 
-	etime := time.Now()
-	dtimeMs := etime.Sub(stime).Milliseconds()
-
-	ttlSuccess := atomic.LoadUint64(&attlSuccess)
-	ttlError := atomic.LoadUint64(&attlError)
-	ttlOps := atomic.LoadUint64(&attlOps)
-	ttlTime := atomic.LoadUint64(&attlTime)
-
-	log.Printf("gocouchbulk:")
-	log.Printf("	Ran for %dms", dtimeMs)
-	log.Printf("	Read %d docs", ttlSuccess)
-	log.Printf("	Had %d errors", ttlError)
-	log.Printf("	Average docs/s of %.2f", float64(ttlSuccess)/float64(dtimeMs)*1000)
-	log.Printf("	Average latency of %f milliseconds", float64(ttlTime)/float64(ttlOps))
+	bench.EndAndPrintReport()
 
 	bucket.Close()
 }
