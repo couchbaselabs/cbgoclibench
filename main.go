@@ -73,9 +73,26 @@ func genTestData(addr, user, pass, bucketName string, docCount int) {
 	}
 }
 
+var docKeyCache []string
+
+func initDocKeys(docCount int) {
+	if docCount <= len(docKeyCache) {
+		return
+	}
+
+	newCache := make([]string, docCount)
+	copy(newCache, docKeyCache)
+
+	for i := len(docKeyCache); i < docCount; i++ {
+		newCache[i] = fmt.Sprintf("upsert-get-%d", i)
+	}
+
+	docKeyCache = newCache
+}
+
 func selectOneKey(docCount int) string {
-	docID := rand.Intn(docCount)
-	return fmt.Sprintf("upsert-get-%d", docID)
+	docIdx := rand.Intn(docCount)
+	return docKeyCache[docIdx]
 }
 
 type benchRunner struct {
@@ -177,6 +194,8 @@ func main() {
 	}
 
 	testName := flag.Arg(0)
+
+	initDocKeys(*docCount)
 
 	if !(*noGenData) {
 		log.Printf("Inserting Test Data...")
