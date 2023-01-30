@@ -167,6 +167,7 @@ func (b *benchRunner) IsRunning() bool {
 }
 
 func main() {
+	cpuProfile := flag.String("cpuprofile", "cpu.prof", "Enables CPU profiling to the specified file")
 	addr := flag.String("host", "172.23.111.135", "The address to connect to")
 	username := flag.String("username", "Administrator", "The username to use")
 	password := flag.String("password", "password", "The password to use")
@@ -182,12 +183,15 @@ func main() {
 
 	flag.Parse()
 
-	f, err := os.Create("cpu.prof")
-	if err != nil {
-		log.Fatal(err)
+	if cpuProfile != nil {
+		f, err := os.Create(*cpuProfile)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		pprof.StartCPUProfile(f)
+		defer pprof.StopCPUProfile()
 	}
-	pprof.StartCPUProfile(f)
-	defer pprof.StopCPUProfile()
 
 	if flag.NArg() < 1 {
 		panic("must specify a test to run (gocb, gocbcore, gocouchbase)")
