@@ -12,9 +12,7 @@ require (
 	github.com/couchbase/gomemcached v0.0.0-20200618124739-5bac349aff71 // indirect
 	github.com/couchbase/goutils v0.0.0-20191018232750-b49639060d85
 	github.com/opentracing/opentracing-go v1.1.0 // indirect
-	golang.org/x/crypto v0.6.0 // indirect
-	golang.org/x/net v0.7.0 // indirect
-	golang.org/x/sync v0.1.0 // indirect
+	golang.org/x/net v0.17.0 // indirect
 	gopkg.in/couchbase/gocbcore.v7 v7.1.17 // indirect
 	gopkg.in/couchbaselabs/gocbconnstr.v1 v1.0.4 // indirect
 	gopkg.in/couchbaselabs/gojcbmock.v1 v1.0.4 // indirect
