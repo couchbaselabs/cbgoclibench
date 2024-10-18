@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"encoding/binary"
 	"flag"
 	"fmt"
+	"hash/crc32"
 	"log"
 	"math/rand"
 	"os"
@@ -16,9 +18,13 @@ import (
 	gocbv1 "github.com/couchbase/gocb"
 	"github.com/couchbase/gocb/v2"
 	gocbcorev7 "github.com/couchbase/gocbcore"
-	"github.com/couchbase/gocbcore/v9"
+	"github.com/couchbase/gocbcore/v10"
 	"github.com/couchbase/gocbcorex"
+	"github.com/couchbase/gocbcorex/memdx"
+	"github.com/couchbase/gomemcached"
+	gomemcachedcli "github.com/couchbase/gomemcached/client"
 	"github.com/couchbase/goutils/logging"
+	gomemcachedlogging "github.com/couchbase/goutils/logging"
 )
 
 func genTestData(addr, user, pass, bucketName string, docCount int) {
@@ -231,6 +237,9 @@ func main() {
 	case "gocbcorex":
 		log.Printf("Running `gocbcorex` benchmark...")
 		benchGocbcoreX(*duration, *addr, *username, *password, *docCount, *numConcurrentOps)
+	case "gomemcached":
+		log.Printf("Running `gomemcached` benchmark...")
+		benchGomemcached(*duration, *addr, *username, *password, *docCount, *numConcurrentOps)
 	}
 }
 
@@ -370,9 +379,9 @@ func benchGocbcore(duration time.Duration, addr, username, password string, docC
 		panic(err)
 	}
 
-	config.KvPoolSize = kvPoolSize
-	config.MaxQueueSize = maxQueueSize
-	config.Auth = &gocbcore.PasswordAuthProvider{
+	config.KVConfig.PoolSize = kvPoolSize
+	config.KVConfig.MaxQueueSize = maxQueueSize
+	config.SecurityConfig.Auth = &gocbcore.PasswordAuthProvider{
 		Username: username,
 		Password: password,
 	}
@@ -709,5 +718,97 @@ func benchGocbcoreX(duration time.Duration, addr, username, password string, doc
 
 	bench.EndAndPrintReport()
 
-	//agent.Close(nil)
+	agent.Close()
+}
+
+func benchGomemcached(duration time.Duration, addr, username, password string, docCount int, numConcurrentOps int) {
+	log.Printf("WARN: Gomemcached is a single-server library, and thus only works on a single-node cluster...")
+
+	bench := benchRunner{
+		Name: fmt.Sprintf("gomemcached (docs: %d, concurrency: %d)",
+			docCount, numConcurrentOps)}
+
+	makeConn := func() *gomemcachedcli.Client {
+		cli, err := gomemcachedcli.Connect("tcp", addr+":11210")
+		if err != nil {
+			panic(fmt.Sprintf("failed to connect: %s", err))
+		}
+
+		helloFeats := make([]byte, 0)
+		helloFeats = binary.BigEndian.AppendUint16(helloFeats, uint16(memdx.HelloFeatureTCPNoDelay))
+		helloFeats = binary.BigEndian.AppendUint16(helloFeats, uint16(memdx.HelloFeatureXerror))
+
+		_, err = cli.Send(&gomemcached.MCRequest{
+			Opcode: gomemcached.HELLO,
+			Key:    []byte("gomemcached"),
+			Body:   helloFeats,
+		})
+		if err != nil {
+			panic(fmt.Sprintf("failed to hello: %s", err))
+		}
+
+		authResp, err := cli.AuthPlain(username, password)
+		if err != nil {
+			panic(fmt.Sprintf("failed to auth: %s", err))
+		}
+
+		if authResp.Status != gomemcached.SUCCESS {
+			panic("failed to auth")
+		}
+
+		_, err = cli.SelectBucket("default")
+		if err != nil {
+			panic(fmt.Sprintf("failed to select bucket: %s", err))
+		}
+
+		return cli
+	}
+
+	calcVbucket := func(key []byte, numVbuckets int) uint16 {
+		crc := crc32.ChecksumIEEE(key)
+		crcMidBits := uint16(crc>>16) & ^uint16(0x8000)
+		return crcMidBits % uint16(numVbuckets)
+	}
+
+	gomemcachedlogging.SetLogger(nil)
+
+	conns := make([]*gomemcachedcli.Client, numConcurrentOps)
+	for i := 0; i < numConcurrentOps; i++ {
+		conns[i] = makeConn()
+	}
+
+	bench.Start()
+
+	var wg sync.WaitGroup
+	var sendOneGet func(*gomemcachedcli.Client)
+	sendOneGet = func(cli *gomemcachedcli.Client) {
+		bop := bench.StartOp()
+
+		key := selectOneKey(docCount)
+		vb := calcVbucket([]byte(key), 1024)
+
+		_, err := cli.Get(vb, key)
+
+		bench.EndOp(bop, err)
+
+		if bench.IsRunning() {
+			sendOneGet(cli)
+		} else {
+			wg.Done()
+		}
+	}
+
+	for i := 0; i < numConcurrentOps; i++ {
+		wg.Add(1)
+		go sendOneGet(conns[i])
+	}
+
+	bench.WaitAndStop(duration)
+	wg.Wait()
+
+	bench.EndAndPrintReport()
+
+	for i := 0; i < numConcurrentOps; i++ {
+		conns[i].Close()
+	}
 }
